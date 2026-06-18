@@ -20,10 +20,12 @@ package org.apache.webbeans.intercept;
 
 import java.lang.annotation.Annotation;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -205,10 +207,11 @@ public class InterceptorsManager
 
     public List<Interceptor<?>> resolveInterceptors(InterceptionType type, Annotation... interceptorBindings)
     {
+        Annotation[] expandedInterceptorBindings = expandTransitiveInterceptorBindings(interceptorBindings);
         List<Interceptor<?>> interceptorList = new ArrayList<>();
         for (Interceptor<?> interceptor : cdiInterceptors)
         {
-            if (interceptor.intercepts(type) && intercepts(interceptor, interceptorBindings) && isInterceptorClassEnabled(interceptor.getBeanClass()))
+            if (interceptor.intercepts(type) && intercepts(interceptor, expandedInterceptorBindings) && isInterceptorClassEnabled(interceptor.getBeanClass()))
             {
                 interceptorList.add(interceptor);
             }
@@ -217,6 +220,71 @@ public class InterceptorsManager
         interceptorList.sort(new InterceptorComparator(webBeansContext));
 
         return interceptorList;
+    }
+
+    // Programmatically registered transitive bindings are kept in InterceptorsManager, not in the
+    // binding annotation bytecode, so they must be folded into the requested set here before matching.
+    private Annotation[] expandTransitiveInterceptorBindings(Annotation[] requestedInterceptorBindings)
+    {
+        // LinkedHashSet keeps the result deterministic (requested bindings first, in their order).
+        Set<Annotation> closure = new LinkedHashSet<>(Arrays.asList(requestedInterceptorBindings));
+        List<Annotation> worklist = new ArrayList<>(closure);
+        for (int i = 0; i < worklist.size(); i++)
+        {
+            Class<? extends Annotation> bindingType = worklist.get(i).annotationType();
+            addClassFormTransitives(bindingType, closure, worklist);
+            addAnnotatedTypeFormTransitives(bindingType, closure, worklist);
+        }
+        return closure.toArray(new Annotation[0]);
+    }
+
+    private void addClassFormTransitives(Class<? extends Annotation> bindingType,
+                                         Set<Annotation> closure, List<Annotation> worklist)
+    {
+        // The Class form stores exactly the bindings the extension passed, so no binding filter is
+        // needed here (unlike the AnnotatedType form, which must filter the type's other annotations).
+        Set<Annotation> transitives = additionalInterceptorBindingTypes.get(bindingType);
+        if (transitives == null)
+        {
+            return;
+        }
+        for (Annotation transitive : transitives)
+        {
+            if (closure.add(transitive))
+            {
+                worklist.add(transitive);
+            }
+        }
+    }
+
+    private void addAnnotatedTypeFormTransitives(Class<? extends Annotation> bindingType,
+                                                 Set<Annotation> closure, List<Annotation> worklist)
+    {
+        for (AnnotatedType<?> annotatedType : additionalInterceptorBindingTypesAnnotatedTypes)
+        {
+            if (annotatedType.getJavaClass().equals(bindingType))
+            {
+                foldAnnotatedTypeBindings(annotatedType, bindingType, closure, worklist);
+            }
+        }
+    }
+
+    private void foldAnnotatedTypeBindings(AnnotatedType<?> annotatedType, Class<? extends Annotation> bindingType,
+                                           Set<Annotation> closure, List<Annotation> worklist)
+    {
+        for (Annotation candidate : annotatedType.getAnnotations())
+        {
+            if (isFoldableTransitiveBinding(candidate, bindingType) && closure.add(candidate))
+            {
+                worklist.add(candidate);
+            }
+        }
+    }
+
+    private boolean isFoldableTransitiveBinding(Annotation candidate, Class<? extends Annotation> bindingType)
+    {
+        return !candidate.annotationType().equals(bindingType)
+                && webBeansContext.getAnnotationManager().isInterceptorBindingAnnotation(candidate.annotationType());
     }
 
     private boolean intercepts(Interceptor<?> interceptor, Annotation[] requestedInterceptorBindings)
